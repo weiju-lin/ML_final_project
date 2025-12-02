@@ -1,0 +1,185 @@
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import r2_score, mean_absolute_error
+import numpy as np
+import matplotlib.pyplot as plt
+
+def main():
+    #讀取資料
+    df = pd.read_excel("Dataset.xlsx", sheet_name="電力消費")
+
+    #民國年份與季別
+    df["roc_year"] = df["統計期"].str.extract(r"民國(\d+)年", expand=False).astype(int)
+    df["quarter"] = df["統計期"].str.extract(r"第(\d+)季", expand=False).astype(int)
+
+    #季別 one-hot（Q1~Q4）
+    quarter_dummies = pd.get_dummies(
+        df["quarter"].astype("category"),
+        prefix="Q",
+        drop_first=False
+    )
+    df = pd.concat([df, quarter_dummies], axis=1)
+
+    #特徵與目標
+    target_col = "全國用電量（千度）"
+    feature_cols = [
+        "工業生產指數（基期=100年）",
+        "臺北平均氣溫（ºC）",
+        "期中人口（人）",
+        "平均匯率（元/美元）",
+        "國內生產毛額GDP（名目值,百萬元）",
+        "國民所得毛額GNI（名目值,百萬元）"
+    ] + list(quarter_dummies.columns)
+
+    #切訓練/測試集：90~110 vs 111+
+    train_df = df[df["roc_year"].between(90, 110)].copy()
+    test_df = df[df["roc_year"] >= 111].copy()
+
+    X_train = train_df[feature_cols]
+    y_train = train_df[target_col]
+    X_test = test_df[feature_cols]
+    y_test = test_df[target_col]
+
+    print("===== Train/Test Info =====")
+    print(f"Train size: {len(train_df)}, years: 90–110")
+    print(f"Test  size: {len(test_df)}, years: 111–{test_df['roc_year'].max()}")
+
+    #隨機森林模型
+    rf = RandomForestRegressor(
+        n_estimators=800,
+        max_depth=None,
+        random_state=42,
+        n_jobs=-1
+    )
+    rf.fit(X_train, y_train)
+
+    #測試集預測
+    y_pred = rf.predict(X_test)
+
+    r2 = r2_score(y_test, y_pred)
+    mae = mean_absolute_error(y_test, y_pred)
+    mape = (np.abs(y_pred - y_test) / y_test).mean()
+
+    print("\n===== Test Metrics =====")
+    print(f"R^2      : {r2:.4f}")
+    print(f"MAE      : {mae:.0f} 千度")
+    print(f"MAPE     : {mape * 100:.2f}%")
+
+    #輸出預測結果
+    result = test_df[["統計期", "roc_year", "quarter", target_col]].copy()
+    result["預測全國用電量（千度）"] = y_pred
+    result["誤差（千度）"] = result["預測全國用電量（千度）"] - result[target_col]
+    result["誤差率（%）"] = (result["誤差（千度）"].abs() / result[target_col]) * 100
+
+    print("\n===== 預測結果（測試集）=====")
+    print(result.to_string(index=False))
+
+    #特徵重要度
+    importances = rf.feature_importances_
+    fi = pd.DataFrame({
+        "feature": feature_cols,
+        "importance": importances
+    }).sort_values("importance", ascending=False)
+
+    print("\n===== Feature Importances =====")
+    print(fi.to_string(index=False))
+
+    #單一時間軸
+    df_sorted = df.sort_values(["roc_year", "quarter"]).copy()
+    df_sorted["time_index"] = df_sorted["roc_year"] + (df_sorted["quarter"] - 1) / 4.0
+
+    result = result.sort_values(["roc_year", "quarter"]).copy()
+    result["time_index"] = result["roc_year"] + (result["quarter"] - 1) / 4.0
+
+    plt.figure(figsize=(11, 6))
+
+    #全期間實際值
+    plt.plot(
+        df_sorted["time_index"],
+        df_sorted[target_col],
+        marker="o",
+        linewidth=1.5,
+        label="Actual"
+    )
+
+    #111年後的預測值
+    plt.plot(
+        result["time_index"],
+        result["預測全國用電量（千度）"],
+        marker="s",
+        linestyle="--",
+        label="Predicted (111+)"
+    )
+
+    #訓練/測試分界線
+    plt.axvline(x=111, linestyle=":", linewidth=1)
+    plt.text(111 + 0.05, df_sorted[target_col].min(),
+             "Train/Test split (111)", fontsize=8)
+
+    plt.title("Historical Electricity Consumption Trend and Forecasts After ROC Year 111")
+    plt.xlabel("ROC Year (with Quarter)")
+    plt.ylabel("National Electricity Consumption (10³ kWh)")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    #全期間年用電量統計
+    print("\n===== 實際年用電量（訓練 + 測試）=====")
+    annual_actual = df.groupby("roc_year")[target_col].sum().reset_index()
+    print(annual_actual.to_string(index=False))
+
+    #111年後預測的年用電量
+    print("\n===== 年用電量（預測值, 111 年後）=====")
+    annual_pred = result.groupby("roc_year")[["全國用電量（千度）", "預測全國用電量（千度）"]].sum()
+    annual_pred["年度誤差"] = annual_pred["預測全國用電量（千度）"] - annual_pred["全國用電量（千度）"]
+    annual_pred["誤差率（%）"] = (annual_pred["年度誤差"].abs() / annual_pred["全國用電量（千度）"]) * 100
+    print(annual_pred.to_string())
+
+    #實際年用電量（90-110）
+    annual_actual = df.groupby("roc_year")[target_col].sum().reset_index()
+    annual_actual.rename(columns={target_col: "yearly_actual"}, inplace=True)
+
+    #測試集年預測（111-113）
+    annual_pred_test = result.groupby("roc_year")["預測全國用電量（千度）"].sum().reset_index()
+    annual_pred_test.rename(columns={"預測全國用電量（千度）": "yearly_pred_test"}, inplace=True)
+
+    plt.figure(figsize=(11, 6))
+
+    #實際年用電量（90-110）
+    plt.plot(
+        annual_actual["roc_year"],
+        annual_actual["yearly_actual"],
+        marker="o",
+        label="Actual (Historical)"
+    )
+
+    #測試集年預測（111–113）
+    plt.plot(
+        annual_pred_test["roc_year"],
+        annual_pred_test["yearly_pred_test"],
+        marker="s",
+        linestyle="--",
+        label="Predicted (111–113)"
+    )
+
+    #訓練/測試分界線
+    plt.axvline(111, linestyle=":", color="gray")
+    plt.text(
+        111 + 0.1,
+        annual_actual["yearly_actual"].min(),
+        "Train/Test Split (111)",
+        fontsize=8
+    )
+
+    plt.title("Annual National Electricity Consumption: Actual vs Predicted")
+    plt.xlabel("ROC Year")
+    plt.ylabel("Total Electricity Consumption (10³ kWh)")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
